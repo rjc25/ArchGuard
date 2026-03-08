@@ -32,87 +32,71 @@ jobs:
       - run: pnpm build
       - run: node scripts/bundle-cli.mjs
 
-      # Package the CLI bundle + better-sqlite3 native addon + Node.js runtime
-      # into a single self-extracting executable via warp-packer
-      - name: Create distribution
+      # Build a self-contained zip/tar.gz with:
+      #   - snoutguard.cjs (bundled CLI)
+      #   - node_modules/better-sqlite3 (native addon, compiled for this platform)
+      #   - node/node[.exe] (bundled Node.js runtime, so users don't need Node installed)
+      #   - snoutguard[.cmd] (launcher script that references the bundled node)
+      - name: Create distribution package
         shell: bash
         run: |
+          set -euo pipefail
           VERSION="${GITHUB_REF#refs/tags/v}"
           DIST_DIR="snoutguard-dist"
-          mkdir -p "$DIST_DIR"
+          mkdir -p "$DIST_DIR/node"
 
-          # Copy the bundled CLI
+          # 1. Copy the bundled CLI
           cp packages/cli/dist/snoutguard.cjs "$DIST_DIR/"
 
-          # Create a minimal package.json for npm install of native deps
-          cat > "$DIST_DIR/package.json" << EOF
-          {
-            "name": "snoutguard-standalone",
-            "version": "${VERSION}",
-            "private": true,
-            "dependencies": {
-              "better-sqlite3": "^11.7.0"
-            }
-          }
-          EOF
-
-          # Install native deps for this platform
+          # 2. Install better-sqlite3 native addon for this platform.
+          #    node-pre-gyp/prebuild-install will download a prebuilt binary
+          #    for the current platform/arch/Node ABI — no compilation needed.
+          node -e "const fs=require('fs');fs.writeFileSync('$DIST_DIR/package.json',JSON.stringify({name:'snoutguard-dist',private:true,dependencies:{'better-sqlite3':'^11.7.0'}},null,2));"
           cd "$DIST_DIR"
-          npm install --omit=dev --ignore-scripts=false
+          npm install --omit=dev
           cd ..
+          # Remove npm artifacts not needed at runtime
+          rm -f "$DIST_DIR/package.json" "$DIST_DIR/package-lock.json"
 
-          # Bundle the Node.js runtime so users don't need it installed
-          NODE_DIR="$DIST_DIR/node"
-          mkdir -p "$NODE_DIR"
-          if [[ "${{ matrix.target }}" == "win-x64" ]]; then
-            cp "$(which node).exe" "$NODE_DIR/node.exe" 2>/dev/null || cp "$(which node)" "$NODE_DIR/node.exe"
-            # Launcher script
-            cat > "$DIST_DIR/snoutguard.cmd" << 'BATCH'
-          @echo off
-          "%~dp0node\node.exe" "%~dp0snoutguard.cjs" %*
-          BATCH
-            EXEC_NAME="snoutguard.cmd"
+          # 3. Bundle the Node.js runtime binary (same version as what compiled better-sqlite3,
+          #    so the native ABI matches)
+          NODE_BIN=$(which node)
+          if [ -f "${NODE_BIN}.exe" ]; then
+            cp "${NODE_BIN}.exe" "$DIST_DIR/node/node.exe"
           else
-            cp "$(which node)" "$NODE_DIR/node"
-            chmod +x "$NODE_DIR/node"
-            # Launcher script
-            cat > "$DIST_DIR/snoutguard" << 'SH'
-          #!/bin/sh
-          exec "$(dirname "$0")/node/node" "$(dirname "$0")/snoutguard.cjs" "$@"
-          SH
+            cp "$NODE_BIN" "$DIST_DIR/node/node"
+            chmod +x "$DIST_DIR/node/node"
+          fi
+
+          # 4. Create launcher and archive
+          if [[ "${{ matrix.target }}" == "win-x64" ]]; then
+            # Windows CMD launcher — %~dp0 gives the batch file's directory at runtime,
+            # so paths are always correct regardless of working directory.
+            # Must use CRLF line endings for .cmd files.
+            printf '@echo off\r\n"%~dp0node\\node.exe" "%~dp0snoutguard.cjs" %%*\r\n' > "$DIST_DIR/snoutguard.cmd"
+
+            # Package as zip (7-Zip is pre-installed on windows-latest GH Actions runners)
+            cd "$DIST_DIR"
+            7z a "../snoutguard-${VERSION}-win-x64.zip" .
+            cd ..
+            echo "Created snoutguard-${VERSION}-win-x64.zip"
+          else
+            # Linux shell launcher — uses $(dirname "$0") so it works from any working dir
+            printf '#!/bin/sh\nSCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"\nexec "$SCRIPT_DIR/node/node" "$SCRIPT_DIR/snoutguard.cjs" "$@"\n' > "$DIST_DIR/snoutguard"
             chmod +x "$DIST_DIR/snoutguard"
-            EXEC_NAME="snoutguard"
-          fi
 
-      - name: Download warp-packer
-        shell: bash
-        run: |
-          if [[ "${{ matrix.target }}" == "win-x64" ]]; then
-            curl -Lo warp-packer.exe https://github.com/dgiagio/warp/releases/download/v0.3.0/windows-x64.warp-packer.exe
-            PACKER="./warp-packer.exe"
-          else
-            curl -Lo warp-packer https://github.com/dgiagio/warp/releases/download/v0.3.0/linux-x64.warp-packer
-            chmod +x warp-packer
-            PACKER="./warp-packer"
-          fi
-          echo "PACKER=$PACKER" >> "$GITHUB_ENV"
-
-      - name: Create executable
-        shell: bash
-        run: |
-          VERSION="${GITHUB_REF#refs/tags/v}"
-          if [[ "${{ matrix.target }}" == "win-x64" ]]; then
-            $PACKER --arch windows-x64 --input_dir snoutguard-dist --exec snoutguard.cmd --output "snoutguard-${VERSION}-win-x64.exe"
-          else
-            $PACKER --arch linux-x64 --input_dir snoutguard-dist --exec snoutguard --output "snoutguard-${VERSION}-linux-x64"
-            chmod +x "snoutguard-${VERSION}-linux-x64"
+            # Package as tar.gz
+            tar -czf "snoutguard-${VERSION}-linux-x64.tar.gz" -C "$DIST_DIR" .
+            echo "Created snoutguard-${VERSION}-linux-x64.tar.gz"
           fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: snoutguard-${{ matrix.target }}
-          path: snoutguard-*-${{ matrix.target }}*
+          path: |
+            snoutguard-*.zip
+            snoutguard-*.tar.gz
 
   publish-npm:
     runs-on: ubuntu-latest
@@ -166,5 +150,5 @@ jobs:
         with:
           generate_release_notes: true
           files: |
-            snoutguard-*-linux-x64
-            snoutguard-*-win-x64.exe
+            snoutguard-*.tar.gz
+            snoutguard-*.zip
