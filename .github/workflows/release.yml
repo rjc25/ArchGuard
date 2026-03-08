@@ -32,93 +32,46 @@ jobs:
       - run: pnpm build
       - run: node scripts/bundle-cli.mjs
 
-      # Build a self-contained zip/tar.gz with:
-      #   - snoutguard.cjs (bundled CLI via esbuild)
-      #   - node_modules/better-sqlite3 + runtime deps (copied from pnpm store — already built)
-      #   - node/node[.exe] (bundled Node.js runtime, matching the ABI used at build time)
-      #   - snoutguard[.cmd] (launcher script that uses %~dp0 / dirname to self-locate)
-      #
-      # We copy better-sqlite3 from the pnpm virtual store rather than running npm install,
-      # because pnpm already compiled/downloaded the correct native binary for this platform.
-      - name: Create distribution package
+      # Copy better-sqlite3 + runtime deps from pnpm store into a flat node_modules/.
+      # Uses Node.js fs.cpSync (handles NTFS junctions on Windows correctly).
+      - name: Copy native dependencies
+        run: node scripts/copy-native-deps.mjs snoutguard-dist
+
+      # Assemble distribution archive:
+      #   snoutguard-dist/
+      #     snoutguard.cjs          (bundled CLI)
+      #     node_modules/           (better-sqlite3 + bindings + file-uri-to-path)
+      #     node/node[.exe]         (bundled Node.js 22 runtime)
+      #     snoutguard[.cmd]        (launcher)
+      - name: Create distribution archive
         shell: bash
         run: |
           set -euo pipefail
           VERSION="${GITHUB_REF#refs/tags/v}"
-          DIST_DIR="snoutguard-dist"
-          mkdir -p "$DIST_DIR/node_modules"
-          mkdir -p "$DIST_DIR/node"
+          DIST="snoutguard-dist"
 
-          # 1. Copy the bundled CLI
-          cp packages/cli/dist/snoutguard.cjs "$DIST_DIR/"
+          # Copy bundled CLI
+          cp packages/cli/dist/snoutguard.cjs "$DIST/"
 
-          # 2. Copy better-sqlite3 and its runtime dependencies from the pnpm virtual store.
-          #    pnpm already installed + compiled/downloaded the correct platform binary,
-          #    so we just copy the result rather than re-running npm install.
-          #
-          #    Runtime dep chain: better-sqlite3 → bindings → file-uri-to-path
-          #    (prebuild-install is an install-time dep only, not needed at runtime)
-          PNPM_STORE="node_modules/.pnpm"
-
-          # Find packages in pnpm store (glob expands correctly in Git Bash on Windows too)
-          SQLITE3_STORE=$(echo "$PNPM_STORE"/better-sqlite3@*/node_modules/better-sqlite3)
-          BINDINGS_STORE=$(echo "$PNPM_STORE"/bindings@*/node_modules/bindings)
-          FUTP_STORE=$(echo "$PNPM_STORE"/file-uri-to-path@*/node_modules/file-uri-to-path)
-
-          # Fallback: file-uri-to-path is also nested inside bindings' directory in pnpm store
-          if [ ! -d "$FUTP_STORE" ]; then
-            FUTP_STORE=$(echo "$PNPM_STORE"/bindings@*/node_modules/file-uri-to-path)
-          fi
-
-          echo "Copying better-sqlite3 from: $SQLITE3_STORE"
-          echo "Copying bindings from: $BINDINGS_STORE"
-          echo "Copying file-uri-to-path from: $FUTP_STORE"
-
-          cp -r "$SQLITE3_STORE" "$DIST_DIR/node_modules/better-sqlite3"
-          cp -r "$BINDINGS_STORE" "$DIST_DIR/node_modules/bindings"
-          cp -r "$FUTP_STORE"    "$DIST_DIR/node_modules/file-uri-to-path"
-
-          # Verify the native addon is present
-          if ! find "$DIST_DIR/node_modules/better-sqlite3" -name "*.node" | grep -q .; then
-            echo "ERROR: Native addon (.node file) not found in better-sqlite3 package!"
-            find "$DIST_DIR/node_modules/better-sqlite3" -type f | head -20
-            exit 1
-          fi
-          echo "Native addon found: $(find "$DIST_DIR/node_modules/better-sqlite3" -name "*.node")"
-
-          # 3. Bundle the Node.js runtime binary.
-          #    Same Node.js version as what compiled better-sqlite3 → ABI is guaranteed to match.
-          NODE_BIN=$(which node)
-          if [ -f "${NODE_BIN}.exe" ]; then
-            cp "${NODE_BIN}.exe" "$DIST_DIR/node/node.exe"
-          else
-            cp "$NODE_BIN" "$DIST_DIR/node/node"
-            chmod +x "$DIST_DIR/node/node"
-          fi
-
-          # 4. Create platform launcher and package as archive
+          # Bundle the Node.js runtime (same version that compiled better-sqlite3 → ABI match)
+          mkdir -p "$DIST/node"
+          NODE_BIN="$(node -e "process.stdout.write(process.execPath)")"
           if [[ "${{ matrix.target }}" == "win-x64" ]]; then
-            # Windows CMD launcher.
-            # %~dp0 expands to the directory containing the .cmd file at runtime,
-            # so paths work regardless of the user's current working directory.
-            # Use printf with \r\n to ensure CRLF line endings (required for .cmd files).
-            printf '@echo off\r\n"%~dp0node\\node.exe" "%~dp0snoutguard.cjs" %%*\r\n' > "$DIST_DIR/snoutguard.cmd"
-
-            # Package as zip using 7-Zip (pre-installed on windows-latest GH Actions runners)
-            cd "$DIST_DIR"
-            7z a "../snoutguard-${VERSION}-win-x64.zip" .
-            cd ..
-            echo "Created: snoutguard-${VERSION}-win-x64.zip ($(du -sh "snoutguard-${VERSION}-win-x64.zip" | cut -f1))"
+            cp "$NODE_BIN" "$DIST/node/node.exe"
           else
-            # Linux shell launcher.
-            # Uses POSIX cd + pwd to get the absolute directory of the script itself,
-            # works correctly even when called via PATH symlinks or relative paths.
-            printf '#!/bin/sh\nSCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"\nexec "$SCRIPT_DIR/node/node" "$SCRIPT_DIR/snoutguard.cjs" "$@"\n' > "$DIST_DIR/snoutguard"
-            chmod +x "$DIST_DIR/snoutguard"
+            cp "$NODE_BIN" "$DIST/node/node"
+            chmod +x "$DIST/node/node"
+          fi
 
-            # Package as tar.gz
-            tar -czf "snoutguard-${VERSION}-linux-x64.tar.gz" -C "$DIST_DIR" .
-            echo "Created: snoutguard-${VERSION}-linux-x64.tar.gz ($(du -sh "snoutguard-${VERSION}-linux-x64.tar.gz" | cut -f1))"
+          # Create platform launcher + archive
+          if [[ "${{ matrix.target }}" == "win-x64" ]]; then
+            # CMD launcher with CRLF line endings
+            printf '@echo off\r\n"%%~dp0node\\node.exe" "%%~dp0snoutguard.cjs" %%*\r\n' > "$DIST/snoutguard.cmd"
+            cd "$DIST" && 7z a -r "../snoutguard-${VERSION}-win-x64.zip" . && cd ..
+          else
+            printf '#!/bin/sh\nDIR="$(cd "$(dirname "$0")" && pwd)"\nexec "$DIR/node/node" "$DIR/snoutguard.cjs" "$@"\n' > "$DIST/snoutguard"
+            chmod +x "$DIST/snoutguard"
+            tar -czf "snoutguard-${VERSION}-linux-x64.tar.gz" -C "$DIST" .
           fi
 
       - name: Upload artifact
